@@ -7,41 +7,70 @@ import numpy as np
 import plotly.express as px
 from urllib.request import urlopen
 import json
-from shapely.geometry import asShape
-from shapely.ops import unary_union
-from geojson import Feature
+import merge_counties
+import plotly.graph_objects as go
 
+## get New York counties
 with urlopen(r'https://raw.githubusercontent.com/rstudio/leaflet/master/docs/json/nycounties.geojson') as ny_response:
     ny_counties = json.load(ny_response)
 
-indices = [56, 58, 59, 60, 61]
-nyc_polygons = [asShape(ny_counties['features'][i]['geometry']) for i in indices]
+## merge 5 nyc boroughs into 1
+ny_counties = merge_counties.merge_counties()
 
-# get the metadata for the first county
-properties = ny_counties['features'][indices[0]]['properties']
-properties['county'] = 'New York City'
-properties['id'] = 36998
-properties['pop'] = 8443713
+## get all other usa counties for future
+# with urlopen(r'https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json') as response:
+#     counties = json.load(response)
 
-# get the union of the polygons
-joined = unary_union(nyc_polygons)
 
-# delete the merged counties
-counties_ny = ny_counties
-for i in reversed(sorted(indices)):
-    del counties_ny['features'][i]
+# get basic census data (population)
+census_json_url = 'https://raw.githubusercontent.com/Zoooook/CoronavirusTimelapse/master/static/population.json'
+df_census = pd.read_json(
+    census_json_url,
+    dtype={"us_county_fips": str})
+df_census = df_census.rename(columns={'us_county_fips': 'fips'})
+df_census['state_county'] = df_census['region'] + '_' + df_census['subregion']
 
-# add the new polygon to the features
-feature = Feature(geometry=joined, properties=properties)
-counties_ny['features'].append(feature)
+## get covid-19 data
+df = pd.read_csv(r'https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv',
+                 dtype={"fips": str})
+df['state_county'] = df['state'] + '_' + df['county']
+df = df.sort_values(by=['date'])
 
-ny_counties = []
-for i in range(len(counties_ny['features'])):
-    current_county = counties_ny['features'][i]['properties']['county']
-    county_dict = {'label': current_county, 'value': current_county}
-    ny_counties.append(county_dict)
+## join census data with corona data on state + county name
+main_df = pd.merge(df, df_census, on='state_county', how='left')
+main_df['fips'] = main_df['fips_y']
+main_df = main_df.drop(columns=['fips_x', 'fips_y', 'state_county',
+                                'us_state_fips', 'region', 'subregion', 'nyt_population'])
 
-ny_counties = sorted(ny_counties, key=lambda k: k['label'])
+## aggregate days into weeks and week count of the year
+main_df['new_date'] = pd.to_datetime(main_df['date'])
+main_df['Year-Week'] = main_df['new_date'].dt.strftime('%Y-%U')
+
+#power_of = 1 / 100
+
+main_df['% cases of total population'] = (main_df['cases'] / main_df['population']) #** power_of
+main_df['% deaths of total population'] = (main_df['deaths'] / main_df['population'])# ** power_of
+
+main_df['deaths_log'] = np.where(np.log(main_df.deaths) == np.inf, 0,
+                                 np.where(np.log(main_df.deaths) == -np.inf, 0, np.log(main_df.deaths)))
+main_df['cases_log'] = np.where(np.log(main_df.cases) == np.inf, 0,
+                                np.where(np.log(main_df.cases) == -np.inf, 0, np.log(main_df.cases)))
+
+main_df = main_df.sort_values(by=['Year-Week'])
+
+## create New York dataframe
+main_df_ny = main_df[main_df['state'] == 'New York'].reset_index(drop=True)
+
+cases_log = 'cases_log'
+deaths_log = 'deaths_log'
+
+print(main_df_ny.columns)
+
+options_dict = [{'label': 'Cases', 'value': 'cases_log'},
+                {'label': 'Deaths', 'value': 'deaths_log'},
+                {'label': '% Cases of Total Population', 'value': '% cases of total population'},
+                {'label': '% Deaths of Total Population', 'value': '% deaths of total population'}]
+
 
 app = dash.Dash(
     __name__,
@@ -60,16 +89,22 @@ app.layout = html.Div([
         html.Img(src='/assets/covid_logo.png')
     ], className='banner'),
 
-    html.Div(
-        dcc.Dropdown(
-            options=ny_counties
-        )
-    ),
+    html.Br(),
+
+    dcc.Dropdown(id='data_selector',
+                 options=options_dict,
+                 multi=False,
+                 value='cases_log'
+                 ),
+
+    html.Div(id='output_container', children=[]),
+    html.Br(),
 
     html.Div([
         html.Div([
             dcc.Graph(
-                id='cases'
+                id='map',
+                config={'displayModeBar': False}
            )
         ], className='six columns'),
 
@@ -77,76 +112,38 @@ app.layout = html.Div([
 
 ])
 
-# app.css.append_css({
-#     'external_url': 'https://codepen.io/chriddyp/pen/bWLwgP.css'
-# })
 
-@app.callback(dash.dependencies.Output('cases', 'figure'),
-              [dash.dependencies.Input('covid_input', 'value')]
-              )
+@app.callback(
+    Output(component_id='map', component_property='figure'),
+    [Input(component_id='data_selector', component_property='value')]
+)
 
-def update_fig():
-    with urlopen(r'https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json') as response:
-        counties = json.load(response)
 
-    df_census = pd.read_json(
-        'https://raw.githubusercontent.com/Zoooook/CoronavirusTimelapse/master/static/population.json',
-        dtype={"us_county_fips": str})
-    df_census = df_census.rename(columns={'us_county_fips': 'fips'})
-    df_census['state_county'] = df_census['region'] + '_' + df_census['subregion']
-    df = pd.read_csv(r'https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv',
-                     dtype={"fips": str})
-    df['state_county'] = df['state'] + '_' + df['county']
-    df = df.sort_values(by=['date'])
-    df_ny = df[df['county'] == 'Nassau']
+def update_fig(selected_dropdown_value):
 
-    with urlopen(r'https://raw.githubusercontent.com/rstudio/leaflet/master/docs/json/nycounties.geojson') as ny_response:
-        ny_counties = json.load(ny_response)
+    df = main_df_ny
 
-    main_df = pd.merge(df, df_census, on='state_county', how='left')
-    main_df = main_df.drop(columns=['fips_x', 'state_county', 'us_state_fips', 'region', 'subregion', 'nyt_population'])
-    main_df['new_date'] = pd.to_datetime(main_df['date'])
-    main_df['Year-Week'] = main_df['new_date'].dt.strftime('%Y-%U')
+    fig = px.choropleth(df,
+                        geojson=ny_counties,
+                        locations="fips",
+                        featureidkey="properties.id",
+                        color=selected_dropdown_value,
+                        color_continuous_scale='Reds',
+                        hover_name="county",
+                        hover_data=['deaths', 'cases', 'population'],
+                        range_color=[0, max(df[selected_dropdown_value])],
+                        scope='usa',
+                        animation_frame="Year-Week"
+                        )
 
-    #power_of = 1 / 100
 
-    main_df['% cases of total population'] = (main_df['cases'] / main_df['population']) #** power_of
-    main_df['% deaths of total population'] = (main_df['deaths'] / main_df['population'])# ** power_of
 
-    main_df['deaths_log'] = np.where(np.log2(main_df.deaths) == np.inf, 0,
-                                     np.where(np.log2(main_df.deaths) == -np.inf, 0, np.log2(main_df.deaths)))
-    main_df['cases_log'] = np.where(np.log2(main_df.cases) == np.inf, 0,
-                                    np.where(np.log2(main_df.cases) == -np.inf, 0, np.log2(main_df.cases)))
-    main_df['% population cases_log'] = np.where(np.log2(main_df.cases) == np.inf, 0,
-                                                 np.where(np.log2(main_df.cases) == -np.inf, 0, np.log2(main_df.cases)))
-    # df_us_week['deaths_log'] = np.log(df_us_week['deaths'])
-    # df_us_week[df_us_week['county']=='Nassau'][df_us_week['date']=='2020-05-18']['deaths_log']
-    main_df = main_df.sort_values(by=['Year-Week'])
-    main_df[main_df['county'] == 'New York City']
-    main_df_ny = main_df[main_df['state'] == 'New York']
+    fig["layout"].pop("updatemenus")
+    fig.update_geos(fitbounds="locations", visible=False)
+    #fig.update_layout(coloraxis_colorbar=dict(title='Deaths', tickprefix='1.e'))
 
-    cases_log = 'cases_log'
-    deaths_log = 'deaths_log'
 
-    data_cases = []
-
-    fig_cases = px.choropleth(main_df_ny,
-                              geojson=ny_counties,
-                              locations="fips_y",
-                              featureidkey="properties.id",
-                              color=cases_log,
-                              color_continuous_scale='Reds',
-                              hover_name="county",
-                              hover_data=['deaths', 'cases', 'population'],
-                              range_color=[0, max(main_df_ny['cases'])],
-                              scope='usa',
-                              animation_frame="Year-Week"
-                              )
-    fig_cases["layout"].pop("updatemenus")
-    fig_cases.update_geos(fitbounds="locations", visible=False)
-    # fig.update_layout(coloraxis_colorbar=dict(title='Deaths', tickprefix='1.e'))
-
-    return fig_cases
+    return fig
 
 if __name__ == '__main__':
     app.run_server(debug=True)
