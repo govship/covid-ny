@@ -12,6 +12,9 @@ import json
 import merge_counties
 import visualization_components as vc
 from datetime import datetime as dt
+import flask
+import os
+from random import randint
 
 ## get New York counties
 with urlopen(r'https://raw.githubusercontent.com/rstudio/leaflet/master/docs/json/nycounties.geojson') as ny_response:
@@ -126,8 +129,10 @@ ui_table['% deaths of total cases'] = ui_table['% deaths of total cases']
 
 #print(main_df_ny[['date', 'Days Since First Case']].iloc[0:60])
 
-app = dash.Dash(__name__)
-server = app.server
+server = flask.Flask(__name__)
+server.secret_key = os.environ.get('secret_key', str(randint(0, 1000000)))
+app = dash.Dash(__name__, server=server)
+
 
 # Create app layout
 app.layout = html.Div(
